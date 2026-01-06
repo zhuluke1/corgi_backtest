@@ -1,128 +1,155 @@
-import yfinance as yf
 import pandas as pd
-import time
-from datetime import datetime, timedelta
+import numpy as np
+import matplotlib.pyplot as plt
+import os
 
-# Load tickers from Excel file
-print("Loading tickers from energy_universe.csv.xlsx...")
-df = pd.read_excel("energy_universe.csv.xlsx")
-tickers = df.iloc[:, 0].astype(str).str.strip().str.upper().unique().tolist()
-tickers = [t for t in tickers if t and t != 'NAN' and pd.notna(t)]
-print(f"Loaded {len(tickers)} tickers\n")
+# Configuration
+EXCEL_FILE = "yfinance_data.xlsx"
+TOP_N = 50
+INITIAL_VALUE = 10000
+OUTPUT_DIR = "outputs"
+os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-# Calculate date range (6 years)
-end_date = datetime.now()
-start_date = end_date - timedelta(days=6*365)
-start_str = start_date.strftime("%Y-%m-%d")
-end_str = end_date.strftime("%Y-%m-%d")
+print("Loading market cap data...")
 
-# Get price data and shares data for each ticker, then calculate daily market cap
-print("Downloading data and calculating daily market cap for each ticker...")
-market_cap_data = {}
-price_data_dict = {}
-shares_data_dict = {}
+# Load market cap data
+sheet_names = pd.ExcelFile(EXCEL_FILE).sheet_names
+market_cap_panel = None
 
-for i, ticker in enumerate(tickers, 1):
-    try:
-        print(f"[{i}/{len(tickers)}] {ticker}...", end=' ')
-        
-        # Get ticker object
-        ticker_obj = yf.Ticker(ticker)
-        
-        # Get daily price data using history()
-        prices = ticker_obj.history(start=start_str, end=end_str, auto_adjust=True)
-        
-        # Get shares outstanding time series using get_shares_full()
-        shares = ticker_obj.get_shares_full(start=None, end=None)
-        
-        if prices.empty:
-            print("✗ (no price data)")
-            continue
-            
-        if shares is None or len(shares) == 0:
-            print("✗ (no shares data)")
-            continue
-        
-        # Remove duplicate dates from prices (keep last value if duplicates exist)
-        if prices.index.duplicated().any():
-            prices = prices[~prices.index.duplicated(keep='last')]
-        
-        # Remove duplicate dates from shares data (keep last value if duplicates exist)
-        if shares.index.duplicated().any():
-            shares = shares[~shares.index.duplicated(keep='last')]
-        
-        # Remove timezone from indices if present
-        if hasattr(prices.index, 'tz') and prices.index.tz is not None:
-            prices.index = prices.index.tz_localize(None) if prices.index.tz is not None else prices.index
-        if hasattr(shares.index, 'tz') and shares.index.tz is not None:
-            shares.index = shares.index.tz_localize(None) if shares.index.tz is not None else shares.index
-        
-        # Store price and shares data
-        price_data_dict[ticker] = prices
-        shares_data_dict[ticker] = shares
-        
-        # Align shares data with price data dates
-        # Forward fill shares data to match price dates
-        shares_aligned = shares.reindex(prices.index).ffill().bfill()
-        
-        # Calculate market cap = Close price * Shares outstanding
-        if 'Close' in prices.columns:
-            market_cap = prices['Close'] * shares_aligned
-            market_cap_data[ticker] = market_cap
-            print(f"✓ ({len(market_cap)} days)")
-        else:
-            print("✗ (no Close price)")
-            
-        time.sleep(0.1)  # Be polite to API
-        
-    except Exception as e:
-        print(f"✗ Error: {e}")
-        continue
+# Preferred: single sheet named 'Market_Cap_Table' with first column = Date(s)
+if 'Market_Cap_Table' in sheet_names:
+    mcap_df = pd.read_excel(EXCEL_FILE, sheet_name='Market_Cap_Table')
+    first_col = mcap_df.columns[0]
+    mcap_df[first_col] = pd.to_datetime(mcap_df[first_col])
+    mcap_df = mcap_df.rename(columns={first_col: 'Date'}).set_index('Date').sort_index()
+    market_cap_panel = mcap_df
+    print(f"Loaded Market_Cap_Table with {market_cap_panel.shape[0]} days × {market_cap_panel.shape[1]} tickers")
+else:
+    # Fallback: per-ticker sheets named '{TICKER}_market_cap'
+    market_cap_dict = {}
+    for sheet in sheet_names:
+        if sheet.endswith("_market_cap"):
+            ticker = sheet.replace("_market_cap", "")
+            try:
+                df = pd.read_excel(EXCEL_FILE, sheet_name=sheet)
+                df['Date'] = pd.to_datetime(df['Date'])
+                df = df.set_index('Date').sort_index()
+                market_cap_dict[ticker] = df['Market_Cap']
+            except:
+                pass
+    print(f"Loaded {len(market_cap_dict)} tickers from per-ticker market cap sheets")
+    if market_cap_dict:
+        all_dates = sorted(set().union(*[s.index for s in market_cap_dict.values()]))
+        market_cap_panel = pd.DataFrame(index=all_dates, columns=list(market_cap_dict.keys()))
+        for ticker, series in market_cap_dict.items():
+            market_cap_panel[ticker] = series
+        market_cap_panel = market_cap_panel.sort_index()
+    else:
+        raise RuntimeError("No market cap data found. Provide 'Market_Cap_Table' or per-ticker '_market_cap' sheets.")
 
-print(f"\nCalculated daily market cap for {len(market_cap_data)} tickers")
+# Load price data
+print("Loading price data...")
+price_dict = {}
+for sheet in sheet_names:
+    if sheet.endswith("_prices"):
+        ticker = sheet.replace("_prices", "")
+        try:
+            df = pd.read_excel(EXCEL_FILE, sheet_name=sheet, index_col=0)
+            df.index = pd.to_datetime(df.index)
+            if 'Close' in df.columns:
+                price_dict[ticker] = df['Close']
+        except:
+            pass
 
-# Save to Excel
-output_file = "yfinance_data.xlsx"
-print(f"\nSaving to {output_file}...")
+# Create price panel
+price_panel = pd.DataFrame(index=market_cap_panel.index, columns=list(price_dict.keys()))
+for ticker, series in price_dict.items():
+    price_panel[ticker] = series
+price_panel = price_panel.sort_index()
 
-try:
-    with pd.ExcelWriter(output_file, engine="openpyxl", mode='w') as writer:
-        # Save price data
-        for ticker, prices in price_data_dict.items():
-            # Remove timezone from index if present
-            prices_to_save = prices.copy()
-            if hasattr(prices_to_save.index, 'tz') and prices_to_save.index.tz is not None:
-                prices_to_save.index = prices_to_save.index.tz_localize(None)
-            prices_to_save.to_excel(writer, sheet_name=f"{ticker}_prices")
-        
-        # Save shares data
-        for ticker, shares in shares_data_dict.items():
-            df = shares.reset_index()
-            df.columns = ['Date', 'Shares_Outstanding']
-            # Remove timezone from Date column if present (convert to naive datetime)
-            df['Date'] = pd.to_datetime(df['Date'])
-            if df['Date'].dt.tz is not None:
-                df['Date'] = df['Date'].dt.tz_convert('UTC').dt.tz_localize(None)
-            df.to_excel(writer, sheet_name=f"{ticker}_shares", index=False)
-        
-        # Save market cap data (daily time series)
-        for ticker, market_cap in market_cap_data.items():
-            df = market_cap.reset_index()
-            df.columns = ['Date', 'Market_Cap']
-            # Remove timezone from Date column if present (convert to naive datetime)
-            df['Date'] = pd.to_datetime(df['Date'])
-            if df['Date'].dt.tz is not None:
-                df['Date'] = df['Date'].dt.tz_convert('UTC').dt.tz_localize(None)
-            df.to_excel(writer, sheet_name=f"{ticker}_market_cap", index=False)
+# Calculate returns
+# If price sheets are available, use price returns; otherwise, approximate with market cap changes
+if len(price_dict) > 0:
+    returns_panel = price_panel.pct_change().fillna(0)
+else:
+    print("No price sheets found. Approximating returns from market cap changes.")
+    returns_panel = market_cap_panel.pct_change().fillna(0)
+
+# Quarterly rebalance dates
+rebalance_dates = []
+for year in market_cap_panel.index.year.unique():
+    for quarter in [1, 2, 3, 4]:
+        quarter_data = market_cap_panel[
+            (market_cap_panel.index.year == year) & 
+            (market_cap_panel.index.quarter == quarter)
+        ]
+        if not quarter_data.empty:
+            rebalance_dates.append(quarter_data.index[-1])
+rebalance_dates = sorted(set(rebalance_dates))
+
+print(f"Rebalancing quarterly: {len(rebalance_dates)} dates")
+
+# Backtest
+print("Running backtest...")
+portfolio_value = pd.Series(index=market_cap_panel.index, dtype=float)
+portfolio_value.iloc[0] = INITIAL_VALUE
+holdings = {}
+
+for i, date in enumerate(market_cap_panel.index[1:], start=1):
+    prev_date = market_cap_panel.index[i-1]
     
-    print(f"✓ Done! Saved to {output_file}")
-    print(f"   - Price data: {len(price_data_dict)} tickers")
-    print(f"   - Shares data: {len(shares_data_dict)} tickers")
-    print(f"   - Market cap data: {len(market_cap_data)} tickers")
+    # Rebalance on quarterly dates
+    if date in rebalance_dates:
+        mcap = market_cap_panel.loc[date].dropna()
+        if len(mcap) >= TOP_N:
+            top_tickers = mcap.nlargest(TOP_N).index.tolist()
+            total_mcap = mcap[top_tickers].sum()
+            holdings = {t: mcap[t] / total_mcap for t in top_tickers}
     
-except PermissionError:
-    print(f"\n✗ ERROR: Cannot save to {output_file}")
-    print("   The file is currently open in another program (likely Excel).")
-    print("   Please close the file and run the script again.")
-except Exception as e:
-    print(f"\n✗ ERROR: Failed to save file: {e}")
+    # Calculate daily return
+    if holdings:
+        daily_return = sum(
+            holdings.get(t, 0) * returns_panel.loc[date, t]
+            for t in holdings.keys()
+            if t in returns_panel.columns and pd.notna(returns_panel.loc[date, t])
+        )
+        portfolio_value.iloc[i] = portfolio_value.iloc[i-1] * (1 + daily_return)
+    else:
+        portfolio_value.iloc[i] = portfolio_value.iloc[i-1]
+
+# Calculate returns
+returns = portfolio_value.pct_change().dropna()
+total_return = (portfolio_value.iloc[-1] / portfolio_value.iloc[0]) - 1
+cagr = (1 + total_return) ** (252 / len(returns)) - 1
+
+print(f"\nResults:")
+print(f"  Total Return: {total_return:.2%}")
+print(f"  CAGR: {cagr:.2%}")
+print(f"  Final Value: ${portfolio_value.iloc[-1]:,.2f}")
+
+# Create graph
+plt.figure(figsize=(14, 8))
+plt.plot(portfolio_value.index, portfolio_value.values, linewidth=2, color='#2E86AB')
+plt.title(f'Top {TOP_N} Market Cap Weighted ETF - Portfolio Performance', fontsize=16, fontweight='bold')
+plt.xlabel('Date', fontsize=12)
+plt.ylabel('Portfolio Value ($)', fontsize=12)
+plt.grid(True, alpha=0.3)
+plt.axhline(y=INITIAL_VALUE, color='r', linestyle='--', alpha=0.5, label=f'Starting: ${INITIAL_VALUE:,}')
+plt.text(portfolio_value.index[-1], portfolio_value.iloc[-1], 
+         f'${portfolio_value.iloc[-1]:,.0f}\n({total_return:.1%})', 
+         fontsize=10, verticalalignment='bottom')
+plt.legend()
+plt.tight_layout()
+plt.savefig(f"{OUTPUT_DIR}/portfolio_performance.png", dpi=300, bbox_inches='tight')
+print(f"\nGraph saved to {OUTPUT_DIR}/portfolio_performance.png")
+plt.show()
+
+# Save portfolio value
+portfolio_df = pd.DataFrame({
+    'Date': portfolio_value.index,
+    'Portfolio_Value': portfolio_value.values,
+    'Daily_Return': portfolio_value.pct_change().values
+})
+portfolio_df.to_csv(f"{OUTPUT_DIR}/portfolio_value.csv", index=False)
+print(f"Data saved to {OUTPUT_DIR}/portfolio_value.csv")
+
