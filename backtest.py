@@ -7,6 +7,7 @@ import os
 EXCEL_FILE = "yfinance_data.xlsx"
 TOP_N = 50
 INITIAL_VALUE = 10000
+ANNUAL_FEE = 0.0049  # 0.49% charged once per year (not daily)
 OUTPUT_DIR = "outputs"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
@@ -89,15 +90,24 @@ rebalance_dates = sorted(set(rebalance_dates))
 
 print(f"Rebalancing quarterly: {len(rebalance_dates)} dates")
 
+# Annual fee dates = last trading day of each calendar year in our index
+year_end_dates = (
+    pd.Series(index=market_cap_panel.index, data=1)
+    .groupby(market_cap_panel.index.to_period("Y"))
+    .tail(1)
+    .index
+)
+year_end_dates = set(year_end_dates)
+
 # Backtest
 print("Running backtest...")
-portfolio_value = pd.Series(index=market_cap_panel.index, dtype=float)
+portfolio_value = pd.Series(index=market_cap_panel.index, dtype=float)         # no fee
+portfolio_value_fee = pd.Series(index=market_cap_panel.index, dtype=float)     # annual fee applied at year-end
 portfolio_value.iloc[0] = INITIAL_VALUE
+portfolio_value_fee.iloc[0] = INITIAL_VALUE
 holdings = {}
 
 for i, date in enumerate(market_cap_panel.index[1:], start=1):
-    prev_date = market_cap_panel.index[i-1]
-    
     # Rebalance on quarterly dates
     if date in rebalance_dates:
         mcap = market_cap_panel.loc[date].dropna()
@@ -114,30 +124,42 @@ for i, date in enumerate(market_cap_panel.index[1:], start=1):
             if t in returns_panel.columns and pd.notna(returns_panel.loc[date, t])
         )
         portfolio_value.iloc[i] = portfolio_value.iloc[i-1] * (1 + daily_return)
+        portfolio_value_fee.iloc[i] = portfolio_value_fee.iloc[i-1] * (1 + daily_return)
     else:
         portfolio_value.iloc[i] = portfolio_value.iloc[i-1]
+        portfolio_value_fee.iloc[i] = portfolio_value_fee.iloc[i-1]
+
+    # Apply annual fee once per year (on last trading day of the year)
+    if date in year_end_dates:
+        portfolio_value_fee.iloc[i] *= (1.0 - ANNUAL_FEE)
 
 # Calculate returns
 returns = portfolio_value.pct_change().dropna()
 total_return = (portfolio_value.iloc[-1] / portfolio_value.iloc[0]) - 1
 cagr = (1 + total_return) ** (252 / len(returns)) - 1
 
+returns_fee = portfolio_value_fee.pct_change().dropna()
+total_return_fee = (portfolio_value_fee.iloc[-1] / portfolio_value_fee.iloc[0]) - 1
+cagr_fee = (1 + total_return_fee) ** (252 / len(returns_fee)) - 1
+
 print(f"\nResults:")
 print(f"  Total Return: {total_return:.2%}")
 print(f"  CAGR: {cagr:.2%}")
 print(f"  Final Value: ${portfolio_value.iloc[-1]:,.2f}")
+print(f"\nResults (With {ANNUAL_FEE:.2%} annual fee, charged once per year):")
+print(f"  Total Return: {total_return_fee:.2%}")
+print(f"  CAGR: {cagr_fee:.2%}")
+print(f"  Final Value: ${portfolio_value_fee.iloc[-1]:,.2f}")
 
 # Create graph
 plt.figure(figsize=(14, 8))
-plt.plot(portfolio_value.index, portfolio_value.values, linewidth=2, color='#2E86AB')
+plt.plot(portfolio_value.index, portfolio_value.values, linewidth=2, color='#2E86AB', label=f'No fee (CAGR {cagr:.2%})')
+plt.plot(portfolio_value_fee.index, portfolio_value_fee.values, linewidth=2, color='#A23B72', label=f'Fee {ANNUAL_FEE:.2%}/yr (CAGR {cagr_fee:.2%})')
 plt.title(f'Top {TOP_N} Market Cap Weighted ETF - Portfolio Performance', fontsize=16, fontweight='bold')
 plt.xlabel('Date', fontsize=12)
 plt.ylabel('Portfolio Value ($)', fontsize=12)
 plt.grid(True, alpha=0.3)
 plt.axhline(y=INITIAL_VALUE, color='r', linestyle='--', alpha=0.5, label=f'Starting: ${INITIAL_VALUE:,}')
-plt.text(portfolio_value.index[-1], portfolio_value.iloc[-1], 
-         f'${portfolio_value.iloc[-1]:,.0f}\n({total_return:.1%})', 
-         fontsize=10, verticalalignment='bottom')
 plt.legend()
 plt.tight_layout()
 plt.savefig(f"{OUTPUT_DIR}/portfolio_performance.png", dpi=300, bbox_inches='tight')
@@ -147,8 +169,10 @@ plt.show()
 # Save portfolio value
 portfolio_df = pd.DataFrame({
     'Date': portfolio_value.index,
-    'Portfolio_Value': portfolio_value.values,
-    'Daily_Return': portfolio_value.pct_change().values
+    'Portfolio_Value_No_Fee': portfolio_value.values,
+    'Portfolio_Value_With_Annual_Fee': portfolio_value_fee.values,
+    'Daily_Return_No_Fee': portfolio_value.pct_change().values,
+    'Daily_Return_With_Annual_Fee': portfolio_value_fee.pct_change().values
 })
 portfolio_df.to_csv(f"{OUTPUT_DIR}/portfolio_value.csv", index=False)
 print(f"Data saved to {OUTPUT_DIR}/portfolio_value.csv")
